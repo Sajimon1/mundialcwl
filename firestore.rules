@@ -1,0 +1,9 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Allow public read and write access to support frictionless PIN-secured multiplayer prediction league sync
+    match /{document=**} {
+      allow read, write: if true;
+    }
+  }
+}
