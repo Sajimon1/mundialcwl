@@ -10,7 +10,7 @@ import {
   query,
   where
 } from 'firebase/firestore';
-import { GoogleAuthProvider, signInWithPopup, signInAnonymously, signOut } from 'firebase/auth';
+import { GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, signInAnonymously, signOut, signInWithEmailAndPassword, createUserWithEmailAndPassword } from 'firebase/auth';
 import { db, auth, handleFirestoreError, testConnection } from './firebase';
 import { Match, UserProfile, Prediction, OperationType } from './types';
 import MatchList from './components/MatchList';
@@ -29,7 +29,9 @@ import {
   ShieldCheck, 
   ShieldAlert, 
   Gamepad2,
-  Lock
+  Lock,
+  Mail,
+  UserPlus
 } from 'lucide-react';
 
 const DISCORD_AVATARS = [
@@ -47,6 +49,7 @@ export default function App() {
   const [loadingAuth, setLoadingAuth] = useState(true);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [isFirebaseRestricted, setIsFirebaseRestricted] = useState(false);
+  const [isLocalMode, setIsLocalMode] = useState<boolean>(false);
 
   // Firestore Data Collections
   const [users, setUsers] = useState<UserProfile[]>([]);
@@ -57,7 +60,7 @@ export default function App() {
   const [showRules, setShowRules] = useState(false);
   const [activeTab, setActiveTab] = useState<"matches" | "standings" | "admin">("matches");
 
-  // Discord Authorization Stg Form
+  // Discord/Auth Authorization Stg Form
   const [username, setUsername] = useState("");
   const [pin, setPin] = useState("");
   const [selectedAvatar, setSelectedAvatar] = useState(DISCORD_AVATARS[0]);
@@ -65,6 +68,12 @@ export default function App() {
   const [adminCode, setAdminCode] = useState("");
   const [authError, setAuthError] = useState("");
   const [submittingAuth, setSubmittingAuth] = useState(false);
+
+  // Expanded Auth Methods
+  const [authMethod, setAuthMethod] = useState<"google" | "email" | "guest" | "local">("local");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [isEmailSignUp, setIsEmailSignUp] = useState(false);
 
   const [countdownText, setCountdownText] = useState("00:00:00");
 
@@ -163,46 +172,27 @@ export default function App() {
     testConnection();
   }, []);
 
-  // 1. Setup Firebase Auth Session Listener
+  // 1. Setup Firebase Auth Session Listener & Cache
   useEffect(() => {
-    const unsubAuth = auth.onAuthStateChanged(async (firebaseUser) => {
-      setIsAuthenticated(!!firebaseUser);
-      if (firebaseUser) {
+    const initSession = async () => {
+      // Restore user credentials from local storage cache
+      const cached = localStorage.getItem("predictor_user_profile");
+      if (cached) {
         try {
-          // Check local persistence first
-          const cachedUser = localStorage.getItem("predictor_user_profile");
-          if (cachedUser) {
-            const parsed = JSON.parse(cachedUser);
-            if (parsed.uid === firebaseUser.uid) {
-              setCurrentUser(parsed);
-              setLoadingAuth(false);
-              return;
-            }
-          }
-
-          // Fetch from Firestore directly to be sure
-          const { getDoc, doc } = await import('firebase/firestore');
-          const userDoc = await getDoc(doc(db, 'users', firebaseUser.uid));
-          if (userDoc.exists()) {
-            const profile = userDoc.data() as UserProfile;
-            setCurrentUser(profile);
-            localStorage.setItem("predictor_user_profile", JSON.stringify(profile));
-          } else {
-            setCurrentUser(null);
-          }
+          const profile = JSON.parse(cached);
+          setCurrentUser(profile);
+          setIsAuthenticated(true);
         } catch (e) {
-          console.error("Failed to read user cache or Firestore profile", e);
+          console.error("Failed to restore cached user session:", e);
         }
       } else {
         setCurrentUser(null);
-        localStorage.removeItem("predictor_user_profile");
+        setIsAuthenticated(false);
       }
       setLoadingAuth(false);
-    });
-
-    return () => {
-      unsubAuth();
     };
+
+    initSession();
   }, []);
 
   // 1b. Realtime database subscription listeners - only triggered when authenticated
@@ -228,20 +218,38 @@ export default function App() {
 
     // Realtime matches listener
     const matchesPath = 'matches';
-    const unsubMatches = onSnapshot(collection(db, matchesPath), (snapshot) => {
+    const unsubMatches = onSnapshot(collection(db, matchesPath), async (snapshot) => {
       const matchesData: Match[] = [];
       snapshot.forEach(doc => {
         matchesData.push(doc.data() as Match);
       });
       
-      setMatches(matchesData);
+      // Auto-seed default matches in cloud if completely empty!
+      if (matchesData.length === 0) {
+        const defaultMatches: Match[] = [
+          { id: "match_1", teamA: "Polska", teamB: "Austria", date: new Date(Date.now() + 86400000).toISOString(), status: "scheduled", group: "Grupa A" },
+          { id: "match_2", teamA: "Francja", teamB: "Holandia", date: new Date(Date.now() + 172800000).toISOString(), status: "scheduled", group: "Grupa A" },
+          { id: "match_3", teamA: "Niemcy", teamB: "Szkocja", date: new Date(Date.now() - 3600000).toISOString(), status: "finished", group: "Grupa B", scoreA: 3, scoreB: 1 },
+          { id: "match_4", teamA: "Hiszpania", teamB: "Włochy", date: new Date(Date.now() + 259200000).toISOString(), status: "scheduled", group: "Grupa B" },
+        ];
+        const { setDoc, doc } = await import('firebase/firestore');
+        for (const m of defaultMatches) {
+          try {
+            await setDoc(doc(db, 'matches', m.id), m);
+          } catch (err) {
+            console.error("Failed to seed match:", err);
+          }
+        }
+      } else {
+        setMatches(matchesData);
+      }
     }, (error) => {
       handleFirestoreError(error, OperationType.LIST, matchesPath);
     });
 
     // Realtime predictions listener
     const predictionsPath = 'predictions';
-    const currentUid = auth.currentUser?.uid || currentUser?.uid || '';
+    const currentUid = currentUser?.uid || '';
     const q = query(collection(db, predictionsPath), where('userId', '==', currentUid));
     const unsubPredictions = onSnapshot(q, (snapshot) => {
       const predictionsData: Prediction[] = [];
@@ -258,7 +266,7 @@ export default function App() {
       unsubMatches();
       unsubPredictions();
     };
-  }, [isAuthenticated, currentUser?.uid]);
+  }, [isAuthenticated, isLocalMode, currentUser?.uid]);
 
   // Update current user state whenever users list or local record is updated
   useEffect(() => {
@@ -319,6 +327,209 @@ export default function App() {
     }
   };
 
+  // 2c. Google Sign-In with Redirect Handler (for mobile or blocked popups or Vercel setups)
+  const handleGoogleSignInWithRedirect = async () => {
+    setAuthError("");
+    setSubmittingAuth(true);
+    try {
+      const provider = new GoogleAuthProvider();
+      provider.setCustomParameters({
+        prompt: 'select_account'
+      });
+      await signInWithRedirect(auth, provider);
+    } catch (err: any) {
+      console.error("Google Redirect Sign-In Error: ", err);
+      if (err?.code === "auth/unauthorized-domain") {
+        setAuthError("Błąd domeny: Ten adres URL nie został dodany do 'Autoryzowanych domen' w Twoim panelu Firebase Console -> Auth -> Ustawienia.");
+      } else {
+        setAuthError(`Błąd logowania przekierowaniem Google: ${err?.message || err}`);
+      }
+      setSubmittingAuth(false);
+    }
+  };
+
+  // 2d. Email/Password Authentication Handler
+  const handleEmailAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError("");
+    const trimmedEmail = email.trim();
+    const trimmedPassword = password.trim();
+
+    if (!trimmedEmail || !trimmedPassword) {
+      setAuthError("Podaj adres e-mail i hasło!");
+      return;
+    }
+    if (trimmedPassword.length < 6) {
+      setAuthError("Hasło musi mieć co najmniej 6 znaków!");
+      return;
+    }
+
+    setSubmittingAuth(true);
+    try {
+      let authResult;
+      if (isEmailSignUp) {
+        authResult = await createUserWithEmailAndPassword(auth, trimmedEmail, trimmedPassword);
+      } else {
+        authResult = await signInWithEmailAndPassword(auth, trimmedEmail, trimmedPassword);
+      }
+      const user = authResult.user;
+      if (user) {
+        const { getDoc, doc } = await import('firebase/firestore');
+        const userDoc = await getDoc(doc(db, 'users', user.uid));
+        if (userDoc.exists()) {
+          const profile = userDoc.data() as UserProfile;
+          setCurrentUser(profile);
+          localStorage.setItem("predictor_user_profile", JSON.stringify(profile));
+          setActiveTab("matches");
+        } else {
+          // Trigger onboarding phase
+          setUsername("");
+          setCurrentUser(null);
+        }
+      }
+    } catch (err: any) {
+      console.error("E-mail Auth Error: ", err);
+      if (err?.code === "auth/operation-not-allowed" || err?.message?.includes("operation-not-allowed")) {
+        setAuthError("firebase-email-disabled");
+      } else {
+        let readableError = err?.message || err;
+        if (err?.code === "auth/email-already-in-use") {
+          readableError = "Ten e-mail jest już zarejestrowany. Zaloguj się lub użyj innego.";
+        } else if (err?.code === "auth/invalid-credential" || err?.code === "auth/wrong-password" || err?.code === "auth/user-not-found") {
+          readableError = "Nieprawidłowy adres e-mail lub hasło!";
+        } else if (err?.code === "auth/invalid-email") {
+          readableError = "Niepoprawny format adresu e-mail!";
+        } else if (err?.code === "auth/weak-password") {
+          readableError = "Hasło musi mieć co najmniej 6 znaków!";
+        }
+        setAuthError(readableError);
+      }
+    } finally {
+      setSubmittingAuth(false);
+    }
+  };
+
+  // 2e. Szybkie Logowanie jako Gość (Anonymous)
+  const handleGuestSignIn = async () => {
+    setAuthError("");
+    setSubmittingAuth(true);
+    try {
+      const authResult = await signInAnonymously(auth);
+      const user = authResult.user;
+      if (user) {
+        const { getDoc, doc } = await import('firebase/firestore');
+        const userDoc = await getDoc(doc(db, 'users', user.uid));
+        if (userDoc.exists()) {
+          const profile = userDoc.data() as UserProfile;
+          setCurrentUser(profile);
+          localStorage.setItem("predictor_user_profile", JSON.stringify(profile));
+          setActiveTab("matches");
+        } else {
+          // Trigger onboarding phase
+          setUsername("");
+          setCurrentUser(null);
+        }
+      }
+    } catch (err: any) {
+      console.error("Guest Auth Error: ", err);
+      if (err?.code === "auth/admin-restricted-operation" || err?.message?.includes("admin-restricted-operation")) {
+        setAuthError("firebase-guest-disabled");
+      } else {
+        setAuthError(`Błąd szybkiego logowania: ${err?.message || err}`);
+      }
+    } finally {
+      setSubmittingAuth(false);
+    }
+  };
+
+  const handleLocalSignIn = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError("");
+    setSubmittingAuth(true);
+    
+    if (username.trim().length < 2) {
+      setAuthError("Nazwa gracza musi mieć co najmniej 2 znaki!");
+      setSubmittingAuth(false);
+      return;
+    }
+
+    const formattedUsername = username.trim();
+    // Normalize username as alphanumeric string for Firestore Document ID
+    const docId = formattedUsername.toLowerCase().replace(/[^a-z0-9_]/g, "");
+    
+    if (docId.length < 2) {
+      setAuthError("Nazwa gracza musi zawierać odpowiednie znaki alfanumeryczne!");
+      setSubmittingAuth(false);
+      return;
+    }
+
+    try {
+      const { getDoc, doc, setDoc } = await import('firebase/firestore');
+      const userRef = doc(db, 'users', docId);
+      const userSnap = await getDoc(userRef);
+      
+      if (userSnap.exists()) {
+        const existingProfile = userSnap.data() as UserProfile;
+        
+        // Validate PIN
+        const testPin = pin || "0000";
+        const actualPin = existingProfile.pin || "0000";
+        
+        if (testPin !== actualPin) {
+          setAuthError("Nieprawidłowy PIN dla tego gracza! Jeśli to nowa nazwa profilu, zmień ją.");
+          setSubmittingAuth(false);
+          return;
+        }
+
+        // Update avatar (and save back to Firestore)
+        const updatedProfile = {
+          ...existingProfile,
+          avatarUrl: selectedAvatar,
+        };
+        await setDoc(userRef, updatedProfile);
+        
+        setCurrentUser(updatedProfile);
+        setIsAuthenticated(true);
+        localStorage.setItem("predictor_user_profile", JSON.stringify(updatedProfile));
+        setActiveTab("matches");
+      } else {
+        // Create new cloud profile
+        let verifyAdmin = false;
+        if (adminCode.trim()) {
+          if (adminCode.trim() === "2026" || adminCode.trim() === "mundial2026") {
+            verifyAdmin = true;
+          } else {
+            setAuthError("Nieprawidłowy kod administratora!");
+            setSubmittingAuth(false);
+            return;
+          }
+        }
+
+        const newProfile: UserProfile = {
+          uid: docId,
+          username: formattedUsername,
+          avatarUrl: selectedAvatar,
+          points: 0,
+          isAdmin: verifyAdmin,
+          pin: pin || "0000",
+          createdAt: new Date().toISOString()
+        };
+
+        await setDoc(userRef, newProfile);
+        
+        setCurrentUser(newProfile);
+        setIsAuthenticated(true);
+        localStorage.setItem("predictor_user_profile", JSON.stringify(newProfile));
+        setActiveTab("matches");
+      }
+    } catch (err: any) {
+      console.error("Cloud PIN sign-in error: ", err);
+      setAuthError("Błąd zapisu w chmurze: " + (err.message || String(err)));
+    } finally {
+      setSubmittingAuth(false);
+    }
+  };
+
   // 2b. Complete Profile Onboarding Handler (for first-time Google sign-ins)
   const handleOnboardingSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -330,9 +541,56 @@ export default function App() {
     }
     
     const formattedUsername = username.trim();
+
+    if (isLocalMode) {
+      try {
+        setSubmittingAuth(true);
+        const localUsers = JSON.parse(localStorage.getItem("predictor_local_users") || "[]");
+        const isTaken = localUsers.some((u: any) => u.username.toLowerCase() === formattedUsername.toLowerCase());
+        if (isTaken) {
+          setAuthError("Ta nazwa użytkownika jest już zajęta w Waszej grupie!");
+          return;
+        }
+
+        let verifyAdmin = false;
+        if (adminCode.trim()) {
+          if (adminCode.trim() === "2026" || adminCode.trim() === "mundial2026") {
+            verifyAdmin = true;
+          } else {
+            setAuthError("Nieprawidłowy kod administratora!");
+            return;
+          }
+        }
+
+        const newUid = `local_${Date.now()}`;
+        const newProfile: UserProfile = {
+          uid: newUid,
+          username: formattedUsername,
+          avatarUrl: selectedAvatar,
+          points: 0,
+          isAdmin: verifyAdmin,
+          pin: pin || "0000",
+          createdAt: new Date().toISOString()
+        };
+
+        localUsers.push(newProfile);
+        localStorage.setItem("predictor_local_users", JSON.stringify(localUsers));
+        setCurrentUser(newProfile);
+        setIsAuthenticated(true);
+        localStorage.setItem("predictor_user_profile", JSON.stringify(newProfile));
+        window.dispatchEvent(new Event("local_db_updated"));
+        setActiveTab("matches");
+      } catch (err: any) {
+        setAuthError(`Nie udało się zapisać profilu: ${err?.message || err}`);
+      } finally {
+        setSubmittingAuth(false);
+      }
+      return;
+    }
+
     const googleUser = auth.currentUser;
     if (!googleUser) {
-      setAuthError("Brak zalogowanego użytkownika Google! Spróbuj zalogować się ponownie.");
+      setAuthError("Brak aktywnej sesji użytkownika! Spróbuj zalogować się ponownie.");
       return;
     }
     
@@ -388,6 +646,7 @@ export default function App() {
     try {
       await signOut(auth);
       setCurrentUser(null);
+      setIsAuthenticated(false);
       localStorage.removeItem("predictor_user_profile");
     } catch (e) {
       console.error(e);
@@ -579,8 +838,11 @@ export default function App() {
             <div className="p-2 bg-indigo-500/10 rounded-xl border border-indigo-500/25 text-indigo-400 shadow-[0_0_15px_rgba(99,102,241,0.15)]">
               <Trophy className="w-5 h-5 shrink-0" />
             </div>
-            <div>
+            <div className="flex items-center gap-2">
               <h1 className="text-sm font-black text-slate-100 uppercase tracking-widest leading-none">CWEL <span className="text-indigo-400">LIGA</span></h1>
+              {isLocalMode && (
+                <span className="text-[8.5px] font-black tracking-widest bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 px-2 py-0.5 rounded-md uppercase font-mono animate-pulse">Symulator ⚡</span>
+              )}
             </div>
           </div>
 
@@ -648,46 +910,192 @@ export default function App() {
               </div>
 
               {authError && (
-                <div className="mb-5 p-3.5 bg-rose-500/10 border border-rose-500/20 rounded-xl text-rose-400 text-xs flex gap-2.5 items-start font-medium select-none animate-in fade-in duration-200">
-                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                  <span>{authError}</span>
-                </div>
+                authError === "firebase-email-disabled" ? (
+                  <div className="mb-5 p-4 bg-amber-500/10 border border-amber-500/20 rounded-2xl text-amber-300 text-xs leading-relaxed space-y-3 animate-in fade-in duration-200">
+                    <div className="flex gap-2.5 items-center font-bold text-amber-400 border-b border-amber-500/15 pb-2">
+                      <ShieldAlert className="w-5 h-5 shrink-0" />
+                      <span className="uppercase tracking-wider font-mono text-[10px]">Logowanie E-mail jest wyłączone!</span>
+                    </div>
+                    <p className="text-[11px] text-slate-350">
+                      Błąd <code className="font-mono bg-slate-950 px-1 py-0.5 rounded text-amber-400 text-[10px]">auth/operation-not-allowed</code> oznacza, że dostawca logowania przez E-mail/Hasło nie jest włączony w konsoli Firebase!
+                    </p>
+                    <div className="bg-slate-950/80 p-3 rounded-xl space-y-1.5 border border-slate-800 text-[10.5px] text-slate-400">
+                      <p className="font-extrabold text-slate-300 text-[9px] uppercase tracking-wider font-mono">Jak to włączyć w 20 sekund:</p>
+                      <ol className="list-decimal pl-4 space-y-1 text-slate-400">
+                        <li>Wejdź na stronę <a href="https://console.firebase.google.com/" target="_blank" rel="noopener noreferrer" className="text-indigo-400 hover:underline font-bold">Firebase Console</a>.</li>
+                        <li>Wybierz swój projekt, a następnie przejdź do <strong className="text-slate-250">Authentication</strong> w menu po lewej stronie.</li>
+                        <li>Kliknij zakładkę <strong className="text-slate-250">Sign-in method</strong> na górze ekranu.</li>
+                        <li>Kliknij przycisk <strong className="text-indigo-400 font-bold">Add new provider</strong> (Dodaj nowego dostawcę).</li>
+                        <li>Wybierz <strong className="text-slate-250">Email/Password</strong> (E-mail i hasło), włącz pierwszy suwak i kliknij <strong className="text-indigo-400">Save</strong>.</li>
+                      </ol>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setAuthError("")}
+                      className="w-full py-2 bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 font-extrabold text-[10px] uppercase tracking-wider rounded-xl transition cursor-pointer border border-amber-500/20"
+                    >
+                      Rozumiem, zamknij i spróbuj ponownie
+                    </button>
+                  </div>
+                ) : authError === "firebase-guest-disabled" ? (
+                  <div className="mb-5 p-4 bg-amber-500/10 border border-amber-500/20 rounded-2xl text-amber-300 text-xs leading-relaxed space-y-3 animate-in fade-in duration-200">
+                    <div className="flex gap-2.5 items-center font-bold text-amber-400 border-b border-amber-500/15 pb-2">
+                      <ShieldAlert className="w-5 h-5 shrink-0" />
+                      <span className="uppercase tracking-wider font-mono text-[10px]">Logowanie Gościa jest wyłączone!</span>
+                    </div>
+                    <p className="text-[11px] text-slate-350">
+                      Błąd <code className="font-mono bg-slate-950 px-1 py-0.5 rounded text-amber-400 text-[10px]">auth/admin-restricted-operation</code> oznacza, że logowanie anonimowe nie zostało włączone w konsoli Firebase!
+                    </p>
+                    <div className="bg-slate-950/80 p-3 rounded-xl space-y-1.5 border border-slate-800 text-[10.5px] text-slate-400">
+                      <p className="font-extrabold text-slate-300 text-[9px] uppercase tracking-wider font-mono">Jak to włączyć w 20 sekund:</p>
+                      <ol className="list-decimal pl-4 space-y-1 text-slate-400">
+                        <li>Wejdź na stronę <a href="https://console.firebase.google.com/" target="_blank" rel="noopener noreferrer" className="text-indigo-400 hover:underline font-bold">Firebase Console</a>.</li>
+                        <li>Wybierz swój projekt, a następnie przejdź do <strong className="text-slate-250">Authentication</strong> w menu po lewej stronie.</li>
+                        <li>Kliknij zakładkę <strong className="text-slate-250">Sign-in method</strong> na górze ekranu.</li>
+                        <li>Kliknij przycisk <strong className="text-indigo-400 font-bold">Add new provider</strong> (Dodaj nowego dostawcę).</li>
+                        <li>Wybierz <strong className="text-slate-250">Anonymous</strong> (Anonimowe), włącz suwak i kliknij <strong className="text-indigo-400">Save</strong>.</li>
+                      </ol>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setAuthError("")}
+                      className="w-full py-2 bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 font-extrabold text-[10px] uppercase tracking-wider rounded-xl transition cursor-pointer border border-amber-500/20"
+                    >
+                      Rozumiem, zamknij i spróbuj ponownie
+                    </button>
+                  </div>
+                ) : (
+                  <div className="mb-5 p-3.5 bg-rose-500/10 border border-rose-500/20 rounded-xl text-rose-400 text-xs flex gap-2.5 items-start font-medium select-none animate-in fade-in duration-200">
+                    <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                    <span>{authError}</span>
+                  </div>
+                )
               )}
 
               {!isAuthenticated ? (
-                /* GOOGLE SIGN IN SCREEN */
-                <div className="space-y-6 animate-in fade-in duration-300">
-                  <div className="p-4 bg-indigo-950/40 border border-indigo-900/40 rounded-2xl text-xs text-indigo-200 leading-relaxed space-y-2">
-                    <p className="font-extrabold text-indigo-300 text-[10px] uppercase tracking-wider font-mono">Bezpieczne Logowanie</p>
-                    <p className="text-slate-300">
-                      Zabezpiecz swój profil przed edycją Twoich typów przez innych graczy. Twoje konto Google posłuży do bezpiecznego zapamiętania Twoich punktów na każdym urządzeniu!
-                    </p>
-                  </div>
+                /* EXCLUSIVE LOCAL USER LOG IN */
+                <div className="space-y-5 animate-in fade-in duration-300">
+                  <form onSubmit={handleLocalSignIn} className="space-y-4 animate-in fade-in duration-250">
+                    <div className="p-3.5 bg-emerald-500/10 border border-emerald-500/20 rounded-2xl text-[11px] text-emerald-350 leading-relaxed font-sans">
+                      <p className="font-extrabold text-emerald-400 text-[10px] uppercase tracking-wider font-mono mb-1">⚡ Panel Gracza Ligi Typera</p>
+                      Wybierz istniejący profil poniżej lub stwórz zupełnie nowy, aby natychmiast typować mecze! Wszystkie dane i punktacja zapisują się automatycznie w Twojej przeglądarce.
+                    </div>
 
-                  <button
-                    onClick={handleGoogleSignIn}
-                    disabled={submittingAuth}
-                    type="button"
-                    className="w-full py-4 bg-white hover:bg-slate-100 disabled:bg-slate-800 disabled:text-slate-500 text-slate-900 font-extrabold uppercase tracking-widest text-xs rounded-2xl shadow-xl transition-all transform active:scale-95 cursor-pointer flex items-center justify-center gap-3 border border-slate-200 font-sans"
-                  >
-                    {submittingAuth ? (
-                      <div className="w-4 h-4 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin"></div>
-                    ) : (
-                      <svg className="w-5 h-5 shrink-0" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                        <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4" />
-                        <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853" />
-                        <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22c-.87-2.6-3.3-4.53-6.16-4.53z" fill="#FBBC05" />
-                        <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335" />
-                      </svg>
-                    )}
-                    {submittingAuth ? "ŁĄCZENIE..." : "ZALOGUJ SIĘ PRZEZ GOOGLE"}
-                  </button>
+                    {(() => {
+                      const localUsers = JSON.parse(localStorage.getItem("predictor_local_users") || "[]");
+                      if (localUsers.length > 0) {
+                        return (
+                          <div className="space-y-2 p-3 bg-slate-950 border border-slate-805 rounded-xl">
+                            <p className="text-[9px] font-extrabold text-slate-500 uppercase tracking-widest font-mono">Dostępne profile na tym urządzeniu:</p>
+                            <div className="flex flex-wrap gap-1.5">
+                              {localUsers.map((u: any) => (
+                                <button
+                                  key={u.uid}
+                                  type="button"
+                                  onClick={() => {
+                                    setUsername(u.username);
+                                    setPin(u.pin || "0000");
+                                    setSelectedAvatar(u.avatarUrl);
+                                  }}
+                                  className={`px-2.5 py-1 text-[10.5px] rounded-lg transition text-slate-300 flex items-center gap-1.5 cursor-pointer max-w-[150px] truncate ${
+                                    username.toLowerCase() === u.username.toLowerCase()
+                                      ? 'bg-emerald-600/30 text-emerald-300 border border-emerald-500/50'
+                                      : 'bg-slate-900 hover:bg-slate-800 hover:text-white border border-slate-800'
+                                  }`}
+                                  title={u.username}
+                                >
+                                  <img src={u.avatarUrl} className="w-4 h-4 rounded-full inline" referrerPolicy="no-referrer" />
+                                  <span>{u.username}</span>
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        );
+                      }
+                      return null;
+                    })()}
+
+                    <div>
+                      <label className="block text-[9px] font-extrabold text-slate-400 uppercase tracking-widest mb-1.5 font-mono">
+                        Nazwa gracza / Pseudonim
+                      </label>
+                      <input
+                        type="text"
+                        required
+                        placeholder="np. Szymek, Kowal, Tomek"
+                        value={username}
+                        onChange={(e) => setUsername(e.target.value)}
+                        className="w-full bg-slate-950/80 border-2 border-slate-800 rounded-2xl py-3 px-4 text-slate-100 text-sm focus:outline-hidden focus:border-emerald-505 font-semibold transition"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-[9px] font-extrabold text-slate-400 uppercase tracking-widest mb-1.5 font-mono">
+                        PIN zabezpieczający Twój profil (np. 0005)
+                      </label>
+                      <input
+                        type="password"
+                        placeholder="np. 0000"
+                        value={pin}
+                        onChange={(e) => setPin(e.target.value)}
+                        className="w-full bg-slate-950/80 border-2 border-slate-800 rounded-2xl py-3 px-4 text-slate-100 text-sm focus:outline-hidden focus:border-emerald-505 font-semibold transition"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-[9px] font-extrabold text-slate-400 uppercase tracking-widest mb-1.5 font-mono">
+                        Kod administratora (Wpisz '2026' by zarządzać meczami!)
+                      </label>
+                      <input
+                        type="text"
+                        placeholder="Zostaw puste lub wpisz '2026'"
+                        value={adminCode}
+                        onChange={(e) => setAdminCode(e.target.value)}
+                        className="w-full bg-slate-950/80 border-2 border-slate-800 rounded-2xl py-3 px-4 text-slate-100 text-sm focus:outline-hidden focus:border-emerald-500 font-semibold transition"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-[9px] font-extrabold text-slate-400 uppercase tracking-widest mb-1.5 font-mono">
+                        Wybierz avatar
+                      </label>
+                      <div className="grid grid-cols-6 gap-2 pt-1">
+                        {DISCORD_AVATARS.map((av, idx) => (
+                          <button
+                            key={idx}
+                            type="button"
+                            onClick={() => setSelectedAvatar(av)}
+                            className={`p-1 rounded-xl transition border-2 ${
+                              selectedAvatar === av ? 'border-emerald-500 scale-105 bg-emerald-950/20' : 'border-transparent hover:border-slate-850'
+                            }`}
+                          >
+                            <img src={av} className="w-full aspect-square rounded-lg object-cover" referrerPolicy="no-referrer" />
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <button
+                      type="submit"
+                      disabled={submittingAuth}
+                      className="w-full py-4 bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-850 text-white font-extrabold uppercase tracking-widest text-xs rounded-2xl shadow-lg transition-all transform active:scale-95 flex items-center justify-center gap-2 cursor-pointer font-sans"
+                    >
+                      {submittingAuth ? (
+                        <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                      ) : (
+                        <>
+                          <Gamepad2 className="w-4 h-4 animate-pulse" />
+                          <span>WEJDŹ DO GRY ⚡</span>
+                        </>
+                      )}
+                    </button>
+                  </form>
                 </div>
               ) : (
                 /* PROFILE ONBOARDING FOR NEW USERS */
                 <form onSubmit={handleOnboardingSubmit} className="space-y-5 animate-in fade-in duration-300">
-                  <div className="p-3 bg-indigo-500/15 border border-indigo-500/20 rounded-xl text-[11px] text-indigo-300 leading-relaxed">
-                    🎉 Pomyślnie zalogowano z Google! Teraz stwórz swój profil w Lidze Typera widoczny dla pozostałych graczy.
+                  <div className="p-3 bg-indigo-500/15 border border-indigo-500/20 rounded-xl text-[11px] text-indigo-300 leading-relaxed animate-pulse">
+                    🎉 Połączono pomyślnie! Teraz utwórz swój profil w Lidze Typera, by pozostali gracze widzieli Twoje typy.
                   </div>
 
                   <div>
