@@ -1,6 +1,0 @@
-{
-  "name": "Typowanie Mundialu",
-  "description": "Aplikacja do wspólnego typowania wyników meczów mundialowych w gronie znajomych z automatyczną punktacją, tabelą wyników i logowaniem.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
