@@ -1,0 +1,124 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Reusable global helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && 
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isAdmin == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Validation definitions
+    function isValidUser(data) {
+      return data.uid is string && data.uid.size() <= 128 &&
+             data.username is string && data.username.size() <= 100 &&
+             data.points is number &&
+             data.isAdmin is bool;
+    }
+
+    function isValidMatch(data) {
+      return data.id is string && data.id.size() <= 128 &&
+             data.teamA is string && data.teamA.size() <= 100 &&
+             data.teamB is string && data.teamB.size() <= 100 &&
+             data.group is string && data.group.size() <= 100 &&
+             data.date is string && data.date.size() <= 100 &&
+             data.status is string && data.status.size() <= 50;
+    }
+
+    function isValidPrediction(data) {
+      return data.id is string && data.id.size() <= 128 &&
+             data.userId is string && data.userId.size() <= 128 &&
+             data.username is string && data.username.size() <= 100 &&
+             data.matchId is string && data.matchId.size() <= 128 &&
+             data.predictedA is number &&
+             data.predictedB is number;
+    }
+
+    // Rules for individual collections
+    match /users/{userId} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn();
+      allow create: if isSignedIn() && isOwner(userId) && isValidUser(incoming()) && incoming().points == 0;
+      allow update: if isSignedIn() && (
+        isAdmin() || 
+        (isOwner(userId) && isValidUser(incoming()) && 
+         incoming().points == existing().points)
+      );
+      allow delete: if isAdmin();
+    }
+
+    match /matches/{matchId} {
+      allow get, list: if isSignedIn();
+      allow create: if isSignedIn() && isValidMatch(incoming());
+      allow update: if isAdmin() && isValidMatch(incoming());
+      allow delete: if isAdmin();
+    }
+
+    match /predictions/{predictionId} {
+      allow get: if isSignedIn() && (
+        resource.data.userId == request.auth.uid || 
+        isAdmin() ||
+        get(/databases/$(database)/documents/matches/$(resource.data.matchId)).data.status != 'scheduled'
+      );
+
+      allow list: if isSignedIn() && (
+        resource.data.userId == request.auth.uid ||
+        isAdmin()
+      );
+      
+      allow create: if isSignedIn() && 
+                    isValidPrediction(incoming()) && 
+                    incoming().userId == request.auth.uid &&
+                    exists(/databases/$(database)/documents/matches/$(incoming().matchId)) &&
+                    get(/databases/$(database)/documents/matches/$(incoming().matchId)).data.status == 'scheduled';
+
+      allow update: if isSignedIn() && (
+        isAdmin() || (
+          resource.data.userId == request.auth.uid &&
+          isValidPrediction(incoming()) &&
+          get(/databases/$(database)/documents/matches/$(resource.data.matchId)).data.status == 'scheduled' &&
+          incoming().userId == existing().userId &&
+          incoming().matchId == existing().matchId &&
+          !('pointsEarned' in incoming())
+        )
+      );
+
+      allow delete: if isSignedIn() && (
+        isAdmin() || (
+          resource.data.userId == request.auth.uid &&
+          get(/databases/$(database)/documents/matches/$(resource.data.matchId)).data.status == 'scheduled'
+        )
+      );
+    }
+
+    match /test/{documentId} {
+      allow read: if true;
+    }
+  }
+}
